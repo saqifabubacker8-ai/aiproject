@@ -1,6 +1,16 @@
 import { TAMIL_SONG_DATABASE, findBestSongMatch } from './tamilSongDatabase.js';
 
 const BASE = 'https://www.googleapis.com/youtube/v3';
+const MAX_SEARCH_VARIANTS = 3;
+const SEARCH_CACHE = new Map();
+
+const getYoutubeApiKeys = () => {
+  const raw = process.env.YOUTUBE_API_KEYS || process.env.YOUTUBE_API_KEY || '';
+  return [...new Set(String(raw)
+    .split(/[\n,]/)
+    .map((value) => value.trim())
+    .filter(Boolean))];
+};
 
 const TANGHISH_VARIANTS = [
   ['vaathi', ['vaathi', 'vathi', 'vaathy', 'vaati', 'vathi']],
@@ -73,7 +83,7 @@ export function expandSearchQueries(rawQuery = '') {
   }
 
   const ranked = [...variants].filter((value) => value && value.length > 1);
-  return ranked.slice(0, 12);
+  return ranked.slice(0, MAX_SEARCH_VARIANTS);
 }
 
 const decode = (s = '') =>
@@ -114,29 +124,57 @@ const sanitizeSearchFilters = (filters = {}) => {
 };
 
 async function yt(endpoint, params) {
-  if (!process.env.YOUTUBE_API_KEY) {
-    throw Object.assign(new Error('YOUTUBE_API_KEY is missing on the server.'), { status: 500 });
+  const keys = getYoutubeApiKeys();
+  if (!keys.length) {
+    throw Object.assign(new Error('YOUTUBE_API_KEY or YOUTUBE_API_KEYS is missing on the server.'), { status: 500 });
   }
-  const url = `${BASE}/${endpoint}?${new URLSearchParams({ ...params, key: process.env.YOUTUBE_API_KEY })}`;
-  const res = await fetch(url);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const reason = body.error?.errors?.[0]?.reason;
-    const msg = reason === 'quotaExceeded'
-      ? 'YouTube API daily quota exceeded. Try again tomorrow.'
-      : `YouTube API error: ${body.error?.message || res.statusText}`;
-    throw Object.assign(new Error(msg), { status: res.status === 403 ? 429 : 502 });
+
+  let lastError = null;
+  for (const key of keys) {
+    const url = `${BASE}/${endpoint}?${new URLSearchParams({ ...params, key })}`;
+    const res = await fetch(url);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const reason = body.error?.errors?.[0]?.reason;
+      const quotaExceeded = res.status === 429 || reason === 'quotaExceeded' || String(body.error?.message || '').toLowerCase().includes('quota exceeded');
+      lastError = { res, body };
+      if (quotaExceeded && keys.length > 1) continue;
+      const msg = reason === 'quotaExceeded'
+        ? 'YouTube API daily quota exceeded. Try again tomorrow.'
+        : `YouTube API error: ${body.error?.message || res.statusText}`;
+      throw Object.assign(new Error(msg), { status: res.status === 403 ? 429 : 502 });
+    }
+    return body;
   }
-  return body;
+
+  const { res, body } = lastError || {};
+  const reason = body?.error?.errors?.[0]?.reason;
+  const msg = reason === 'quotaExceeded'
+    ? 'YouTube API daily quota exceeded. Try again tomorrow.'
+    : `YouTube API error: ${body?.error?.message || res?.statusText || 'Request failed.'}`;
+  throw Object.assign(new Error(msg), { status: res?.status === 403 ? 429 : 502 });
 }
 
 export async function searchVideos({ query, filters = {} }) {
   const { maxMinutes, minMinutes } = filters;
   const exactDuration = Boolean(maxMinutes || minMinutes);
+  const safeFilters = sanitizeSearchFilters(filters);
+  const cacheKey = JSON.stringify({
+    query: String(query || '').trim().toLowerCase(),
+    filters: {
+      ...safeFilters,
+      maxMinutes: maxMinutes ?? null,
+      minMinutes: minMinutes ?? null,
+    },
+  });
+
+  if (SEARCH_CACHE.has(cacheKey)) {
+    return SEARCH_CACHE.get(cacheKey);
+  }
+
   const searchQueries = expandSearchQueries(query);
   const collected = [];
   const seen = new Set();
-  const safeFilters = sanitizeSearchFilters(filters);
 
   if (TAMIL_SONG_DATABASE.length) {
     const bestSong = findBestSongMatch(query);
@@ -145,7 +183,7 @@ export async function searchVideos({ query, filters = {} }) {
     }
   }
 
-  for (const searchQuery of searchQueries) {
+  for (const searchQuery of searchQueries.slice(0, MAX_SEARCH_VARIANTS)) {
     const params = {
       part: 'snippet',
       type: 'video',
@@ -168,12 +206,15 @@ export async function searchVideos({ query, filters = {} }) {
   }
 
   const ids = collected.map((i) => i.id.videoId).filter(Boolean);
-  if (!ids.length) return [];
+  if (!ids.length) {
+    SEARCH_CACHE.set(cacheKey, []);
+    return [];
+  }
 
   const details = await yt('videos', { part: 'contentDetails,statistics,status', id: ids.join(',') });
   const info = Object.fromEntries((details.items || []).map((v) => [v.id, v]));
 
-  return collected
+  const results = collected
     .filter((i) => info[i.id.videoId])
     .map((i) => {
       const v = info[i.id.videoId];
@@ -195,4 +236,7 @@ export async function searchVideos({ query, filters = {} }) {
     .filter((v) => (!maxMinutes || v.durationSeconds <= maxMinutes * 60) &&
                    (!minMinutes || v.durationSeconds >= minMinutes * 60))
     .slice(0, 12);
+
+  SEARCH_CACHE.set(cacheKey, results);
+  return results;
 }

@@ -215,6 +215,59 @@ test('searchVideos drops invalid YouTube filter values before calling the API', 
   assert.match(searchUrl, /relevanceLanguage=ta/);
 });
 
+test('searchVideos caps search fan-out to avoid quota exhaustion', async () => {
+  process.env.YOUTUBE_API_KEY = 'test-key';
+  const originalFetch = global.fetch;
+  const searchCalls = [];
+
+  global.fetch = async (url) => {
+    const urlString = String(url);
+    searchCalls.push(urlString);
+
+    if (urlString.includes('/search?')) {
+      return {
+        ok: true,
+        json: async () => ({
+          items: [{
+            id: { videoId: 'demo-video-1' },
+            snippet: {
+              title: 'Demo Song',
+              channelTitle: 'Demo',
+              description: 'Example',
+              thumbnails: { high: { url: 'https://example.com/thumb.jpg' } },
+              publishedAt: '2024-01-01T00:00:00Z',
+            },
+          }],
+        }),
+      };
+    }
+
+    if (urlString.includes('/videos?')) {
+      return {
+        ok: true,
+        json: async () => ({
+          items: [{
+            id: 'demo-video-1',
+            contentDetails: { duration: 'PT3M20S' },
+            statistics: { viewCount: '9000' },
+            status: { embeddable: true, privacyStatus: 'public' },
+          }],
+        }),
+      };
+    }
+
+    throw new Error(`Unexpected fetch URL: ${urlString}`);
+  };
+
+  try {
+    const videos = await searchVideos({ query: 'vaathi coming', filters: {} });
+    assert.equal(videos.length, 1);
+    assert.ok(searchCalls.filter((u) => u.includes('/search?')).length <= 3, 'search fan-out should be capped');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Tanglish and Tamil song titles expand into stronger search variants', () => {
   assert.ok(expandSearchQueries('vaathi coming').includes('Vaathi Coming'));
   assert.ok(expandSearchQueries('vathi coming').includes('Vaathi Coming'));

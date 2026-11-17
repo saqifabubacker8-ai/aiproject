@@ -57,7 +57,7 @@ app.post('/api/assistant', async (req, res) => {
 app.get('/api/health', (_req, res) =>
   res.json({
     ok: true,
-    youtube: Boolean(process.env.YOUTUBE_API_KEY),
+    youtube: Boolean(process.env.YOUTUBE_API_KEY || process.env.YOUTUBE_API_KEYS),
     ai: true,
     parser: 'local-js',
   })
